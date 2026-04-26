@@ -58,8 +58,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # Runtime libraries (no -dev) + the CLI darkroom suite.
 # Why each tool ships in the runtime image:
-#   darktable-cli  — RAW developer; the only path that respects camera
-#                    profiles and ICCs without re-encoding to sRGB
+#   darktable      — provides darktable-cli; the only RAW developer
+#                    that respects camera profiles and ICCs without
+#                    re-encoding to sRGB
 #   exiftool       — read/write every metadata tag the embedded libs miss
 #   libvips-tools  — fastest non-destructive resize / format convert
 #   imagemagick    — universal swiss-army knife (composite, masks, etc.)
@@ -74,8 +75,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libwebp7 \
         libopenjp2-7 \
         libexempi8 \
-        darktable-cli \
-        exiftool \
+        darktable \
+        libimage-exiftool-perl \
         libvips-tools \
         imagemagick \
         gmic \
