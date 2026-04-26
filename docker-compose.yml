@@ -1,0 +1,26 @@
+# =============================================================================
+# photo-mcp — local docker-compose for trying the server without a host
+# install. Mounts a photos directory read-only, an output directory rw, and
+# pipes stdio through the foreground tty.
+#
+# Usage:
+#   OPENAI_API_KEY=sk-... docker compose run --rm photo-mcp
+# =============================================================================
+
+services:
+  photo-mcp:
+    image: ghcr.io/vautieri/photo-mcp:latest
+    build: .
+    stdin_open: true
+    tty: false
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?OPENAI_API_KEY must be set in the host shell}
+      PHOTO_MCP_LOG_LEVEL: ${PHOTO_MCP_LOG_LEVEL:-info}
+      PHOTO_MCP_DEFAULT_GENERATE_MODEL: gpt-image-1.5
+      PHOTO_MCP_DEFAULT_EDIT_MODEL: gpt-image-1.5
+      PHOTO_MCP_COST_CEILING_USD: ${PHOTO_MCP_COST_CEILING_USD:-10.0}
+      PHOTO_MCP_ALLOWED_INPUT_ROOTS: /photos
+      PHOTO_MCP_ALLOWED_OUTPUT_ROOTS: /output
+    volumes:
+      - ${PHOTOS_DIR:-./photos}:/photos:ro
+      - ${OUTPUT_DIR:-./output}:/output:rw

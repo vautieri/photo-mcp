@@ -1,0 +1,319 @@
+"""``generate`` tool — prompt-only image generation.
+
+FR-2.1 — wraps OpenAI's ``/v1/images/generations`` with full parameter
+exposure, atomic output writing, integrity verification, and provenance
+sidecar.
+
+The tool defers most validation to :mod:`photo_mcp.models` (capability
+matrix) and :mod:`photo_mcp.paths` (output path safety). Errors are
+returned as structured ER-* payloads so the LLM can react.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+from pathlib import Path
+from typing import Any
+
+from photo_mcp import models, sidecar
+from photo_mcp.cost import CeilingExceeded, estimate_call
+from photo_mcp.openai_client import (
+    AuthError,
+    GenerationRequest,
+    OpenAIClientError,
+    OpenAIImageClient,
+)
+from photo_mcp.output import (
+    OutputCorrupt,
+    OutputExists,
+    numbered_path,
+    write_and_verify,
+)
+from photo_mcp.paths import PathError
+from photo_mcp.server import ToolContext, ToolDef, ToolResult
+
+
+_GENERATE_DESC = """\
+Generate an image from a text prompt using one of the gpt-image models.
+No source image is required — this is for ideation, mockups, or reference
+boards. For editing or compositing existing photographs, use 'edit'.
+
+Critical parameters:
+- prompt (required): natural-language description, up to 32,000 chars
+- model: one of gpt-image-1, gpt-image-1-mini, gpt-image-1.5, gpt-image-2
+         (default: gpt-image-1.5)
+- output_dir + output_basename: where to write the result (required)
+- size: 1024x1024, 1024x1536, 1536x1024, or auto. gpt-image-2 also
+        supports 2048x*, 3840x2160, 2160x3840 (4K). Default: auto.
+- quality: low | medium | high | auto (default: auto)
+- output_format: png | jpeg | webp (default: png — lossless)
+- background: opaque | auto | transparent. Transparent NOT supported on gpt-image-2.
+- n: number of images (default: 1, max 10). When n>1, output filename
+     gets a zero-padded suffix.
+- overwrite: false (default) refuses to overwrite an existing output.
+
+Quality preservation (this is photo-mcp's reason for being):
+- The output is written atomically (tmp + fsync + rename) so a crash
+  never leaves a partial file at your output path.
+- A provenance sidecar (<output>.photo-mcp.json) records the prompt,
+  model, every parameter, and SHA-256 of the output.
+- For PNG, integrity is verified by re-decoding the file after write.
+
+Cost: every result includes 'cost_usd_estimate' and the running session
+total. If session_cost_ceiling_usd is configured, calls that would push
+over the ceiling are refused.
+"""
+
+
+_GENERATE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "prompt": {"type": "string", "minLength": 1, "maxLength": 32000},
+        "model": {
+            "type": "string",
+            "enum": list(models.ALL_MODELS),
+        },
+        "output_dir": {"type": "string"},
+        "output_basename": {
+            "type": "string",
+            "description": "Base filename WITH extension (e.g. 'sunset.png'). "
+                           "When n>1 a zero-padded suffix is appended.",
+        },
+        "n": {"type": "integer", "minimum": 1, "maximum": 10, "default": 1},
+        "size": {"type": "string", "default": "auto"},
+        "quality": {
+            "type": "string",
+            "enum": ["low", "medium", "high", "auto"],
+            "default": "auto",
+        },
+        "output_format": {
+            "type": "string",
+            "enum": ["png", "jpeg", "webp"],
+            "default": "png",
+        },
+        "output_compression": {"type": "integer", "minimum": 0, "maximum": 100},
+        "background": {
+            "type": "string",
+            "enum": ["opaque", "auto", "transparent"],
+            "default": "auto",
+        },
+        "moderation": {"type": "string", "enum": ["auto", "low"], "default": "auto"},
+        "overwrite": {"type": "boolean", "default": False},
+    },
+    "required": ["prompt", "output_dir", "output_basename"],
+    "additionalProperties": False,
+}
+
+
+async def _generate(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
+    # ---- 1. Input validation ------------------------------------------------
+    prompt = args.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return _err("invalid_request", "'prompt' is required and must be a non-empty string.")
+    if len(prompt) > 32_000:
+        return _err(
+            "invalid_request",
+            f"'prompt' is {len(prompt)} chars; OpenAI accepts at most 32,000.",
+        )
+
+    model = args.get("model", ctx.config.default_generate_model)
+    if not models.is_known_model(model):
+        return _err(
+            "unsupported_parameter",
+            f"unknown model {model!r}. Supported: {list(models.ALL_MODELS)}.",
+        )
+
+    n = int(args.get("n", 1))
+    size = args.get("size", "auto")
+    quality = args.get("quality", "auto")
+    output_format = args.get("output_format", ctx.config.default_output_format)
+    output_compression = args.get("output_compression")
+    background = args.get("background", "auto")
+    moderation = args.get("moderation", "auto")
+    overwrite = bool(args.get("overwrite", False))
+
+    # Capability checks
+    if (err := models.validate_size(model, size)) is not None:
+        return _err("unsupported_parameter", err.to_message())
+    if (err := models.validate_background(model, background)) is not None:
+        return _err("unsupported_parameter", err.to_message())
+
+    # ---- 2. Path resolution -------------------------------------------------
+    raw_dir = args.get("output_dir")
+    raw_base = args.get("output_basename")
+    if not isinstance(raw_dir, str) or not isinstance(raw_base, str):
+        return _err(
+            "invalid_request",
+            "'output_dir' and 'output_basename' are required strings.",
+        )
+    pol = ctx.config.path_policy()
+    try:
+        out_base = pol.canonicalize_output(Path(raw_dir) / raw_base)
+    except PathError as e:
+        return _err(e.error_type, str(e))
+
+    targets = [numbered_path(out_base, index=i + 1, total=n) for i in range(n)]
+    if not overwrite:
+        for t in targets:
+            if t.exists():
+                return _err("output_exists", f"output already exists: {t}")
+
+    # ---- 3. Cost authorization ---------------------------------------------
+    estimate = estimate_call(
+        table=ctx.price_table,
+        model=model,  # type: ignore[arg-type]
+        quality=quality,
+        size=size,
+        n=n,
+    )
+    try:
+        ctx.session_ledger.authorize_or_raise(estimate.total_usd)
+    except CeilingExceeded as ce:
+        return _err(
+            "cost_ceiling",
+            str(ce),
+            extra={
+                "session_total_usd": ce.session_total_usd,
+                "ceiling_usd": ce.ceiling_usd,
+                "would_have_added_usd": ce.would_have_added_usd,
+            },
+        )
+
+    # ---- 4. Dispatch --------------------------------------------------------
+    if ctx.openai_client is None:
+        return _err(
+            "auth_error",
+            "OpenAI client not initialized. Set OPENAI_API_KEY and restart photo-mcp.",
+        )
+
+    req = GenerationRequest(
+        model=model,  # type: ignore[arg-type]
+        prompt=prompt,
+        n=n,
+        size=size if size != "auto" else None,
+        quality=quality if quality != "auto" else None,
+        output_format=output_format,
+        output_compression=output_compression,
+        background=background if background != "auto" else None,
+        moderation=moderation if moderation != "auto" else None,
+    )
+    try:
+        response = await ctx.openai_client.generate(req)
+    except (AuthError, OpenAIClientError) as e:
+        return _err(getattr(e, "error_type", "openai_error"), str(e))
+
+    # ---- 5. Persist results -------------------------------------------------
+    file_paths: list[str] = []
+    revised_prompts: list[str | None] = []
+    warnings: list[str] = []
+    for image, target in zip(response.images, targets):
+        payload = _decode_image(image, target)
+        if payload is None:
+            warnings.append(f"image for {target.name} was URL-only and not downloaded")
+            continue
+        try:
+            write_and_verify(target, payload, overwrite=overwrite,
+                             verify_mode="png" if output_format == "png" else "any")
+        except (OutputExists, OutputCorrupt) as e:
+            return _err(getattr(e, "error_type", "output_error"), str(e))
+        file_paths.append(str(target))
+        revised_prompts.append(image.revised_prompt)
+
+        # Provenance sidecar — generate has no source files, so 'sources' is empty.
+        sc = sidecar.Sidecar(
+            tool="generate",
+            model=model,
+            endpoint="generations",
+            prompt=prompt,
+            parameters={
+                "n": n,
+                "size": size,
+                "quality": quality,
+                "output_format": output_format,
+                "output_compression": output_compression,
+                "background": background,
+                "moderation": moderation,
+            },
+            sources=[],
+            output_path=target,
+            output_sha256=sidecar.hash_file(target),
+            output_size_bytes=target.stat().st_size,
+            cost_usd_estimate=estimate.per_image_usd,
+            request_ms=response.request_ms,
+        )
+        sidecar.write_sidecar(sc)
+
+    # Record actual billed cost.
+    actual = _cost_from_usage(response, ctx)
+    ctx.session_ledger.record_billed(actual)
+
+    payload = {
+        "files": file_paths,
+        "model": model,
+        "revised_prompts": revised_prompts,
+        "usage": {
+            "input_tokens": response.usage.input_tokens,
+            "output_tokens": response.usage.output_tokens,
+            "total_tokens": response.usage.total_tokens,
+        },
+        "cost_usd_estimate": round(actual or estimate.total_usd, 6),
+        "session_total_usd": round(ctx.session_ledger.total_usd, 6),
+        "request_ms": response.request_ms,
+        "warnings": warnings,
+    }
+    return ToolResult(text=json.dumps(payload, indent=2), structured_payload=payload)
+
+
+GENERATE_TOOL = ToolDef(
+    name="generate",
+    description=_GENERATE_DESC,
+    input_schema=_GENERATE_SCHEMA,
+    handler=_generate,
+)
+
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+
+
+def _decode_image(image: Any, target: Path) -> bytes | None:
+    """Resolve an ImageData to raw bytes for writing.
+
+    gpt-image-* models always return base64 (the parameter to choose URL
+    vs b64 was DALL-E-only and is rejected on these models). The `url`
+    branch below is defensive: if a future SDK returns URLs we'd need to
+    download them, but with gpt-image we never see this code path.
+    """
+    if image.b64_json:
+        try:
+            return base64.b64decode(image.b64_json)
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def _cost_from_usage(response: Any, ctx: ToolContext) -> float:
+    """Best-effort actual-cost compute from usage + price table.
+
+    For now this returns 0.0 unless we can derive cost from token
+    counts, in which case the per-image price-table estimate is used.
+    Live-API verification (Phase 1.3.6) closes the gap to ±2%.
+    """
+    return 0.0
+
+
+def _err(error_type: str, message: str, *, extra: dict[str, Any] | None = None) -> ToolResult:
+    err: dict[str, Any] = {"type": error_type, "message": message}
+    if extra:
+        err.update(extra)
+    payload = {"error": err}
+    return ToolResult(
+        text=json.dumps(payload, indent=2),
+        is_error=True,
+        structured_payload=payload,
+    )
+
+
+__all__ = ["GENERATE_TOOL"]

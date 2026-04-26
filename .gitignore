@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+.eggs/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# Tooling caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.hypothesis/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# OS / scratch
+*.log
+*~
+
+# Cassette recordings — re-record on demand, do not commit private API responses
+tests/integration/cassettes/*.yaml
+!tests/integration/cassettes/.gitkeep
+
+# Reference photos may include private originals — opt in per file
+tests/fixtures/photos/*
+!tests/fixtures/photos/.gitkeep
+!tests/fixtures/photos/PROVENANCE.md
+
+# Local secrets — paranoia layer; the API key lives in env, not on disk
+.env
+.env.*
+!.env.example
+
+# Provenance sidecars produced during local runs
+*.photo-mcp.json

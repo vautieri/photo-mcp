@@ -1,0 +1,28 @@
+{
+    "_comment": "Per-image cost reference. Updated against OpenAI's published pricing as of 2026-04-25. The cost.py module reads this file; updates are a one-line change and a re-run of test_cost_accuracy.py against live API.",
+    "_units": "USD per output image",
+    "_source": "https://openai.com/api/pricing — verify before each release",
+    "schema_version": "0.1.0",
+    "models": {
+        "gpt-image-1": {
+            "low_quality":    { "1024x1024": 0.011, "1024x1536": 0.016, "1536x1024": 0.016 },
+            "medium_quality": { "1024x1024": 0.042, "1024x1536": 0.063, "1536x1024": 0.063 },
+            "high_quality":   { "1024x1024": 0.167, "1024x1536": 0.25,  "1536x1024": 0.25  }
+        },
+        "gpt-image-1-mini": {
+            "low_quality":    { "1024x1024": 0.005, "1024x1536": 0.008, "1536x1024": 0.008 },
+            "medium_quality": { "1024x1024": 0.020, "1024x1536": 0.030, "1536x1024": 0.030 },
+            "high_quality":   { "1024x1024": 0.080, "1024x1536": 0.120, "1536x1024": 0.120 }
+        },
+        "gpt-image-1.5": {
+            "low_quality":    { "1024x1024": 0.011, "1024x1536": 0.016, "1536x1024": 0.016 },
+            "medium_quality": { "1024x1024": 0.042, "1024x1536": 0.063, "1536x1024": 0.063 },
+            "high_quality":   { "1024x1024": 0.167, "1024x1536": 0.25,  "1536x1024": 0.25  }
+        },
+        "gpt-image-2": {
+            "low_quality":    { "1024x1024": 0.011, "1024x1536": 0.016, "1536x1024": 0.016, "2048x2048": 0.044, "2048x1152": 0.044, "3840x2160": 0.110, "2160x3840": 0.110 },
+            "medium_quality": { "1024x1024": 0.040, "1024x1536": 0.060, "1536x1024": 0.060, "2048x2048": 0.150, "2048x1152": 0.150, "3840x2160": 0.380, "2160x3840": 0.380 },
+            "high_quality":   { "1024x1024": 0.110, "1024x1536": 0.165, "1536x1024": 0.165, "2048x2048": 0.420, "2048x1152": 0.420, "3840x2160": 1.050, "2160x3840": 1.050 }
+        }
+    }
+}
