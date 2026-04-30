@@ -50,8 +50,17 @@ _LIST_MODELS_SCHEMA: dict[str, Any] = {
 
 
 async def _list_models(_ctx: ToolContext, _args: dict[str, Any]) -> ToolResult:
+    allowed = _ctx.config.allowed_models
     matrix = []
     for cap in models.all_capabilities():
+        # If operator configured an allowlist, hide other models from the
+        # client. The LLM picks from what it sees; if gpt-image-2 isn't
+        # exposed, it won't try to call it. This is the primary mechanism
+        # for "my org isn't verified for gpt-image-2" — operator sets
+        # PHOTO_MCP_ALLOWED_MODELS=gpt-image-1.5,gpt-image-1 and the model
+        # never appears in any tool response.
+        if allowed and cap.model not in allowed:
+            continue
         matrix.append({
             "model": cap.model,
             "allowed_sizes": list(cap.allowed_sizes),
@@ -148,6 +157,18 @@ async def _estimate_cost(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         return _structured_error(
             "unsupported_parameter",
             f"unknown or missing 'model'; expected one of {list(models.ALL_MODELS)}",
+        )
+    # Mirror the allowlist gate from edit/generate. Without this, the LLM can
+    # still call estimate_cost with a disallowed model and receive a price —
+    # which signals "this model exists" and may prompt it to retry the
+    # actual edit/generate call against the gated model.
+    if ctx.config.allowed_models and model not in ctx.config.allowed_models:
+        return _structured_error(
+            "unsupported_parameter",
+            f"model {model!r} is not in this server's allowed_models "
+            f"set ({list(ctx.config.allowed_models)}). Operator restricted "
+            f"the model list (typically because the OpenAI org isn't "
+            f"verified for the excluded models).",
         )
     quality = args.get("quality", "auto")
     size = args.get("size", "auto")

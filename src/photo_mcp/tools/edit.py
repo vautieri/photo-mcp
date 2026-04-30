@@ -167,6 +167,14 @@ async def _edit(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
             "unsupported_parameter",
             f"unknown model {model!r}. Supported: {list(models.ALL_MODELS)}.",
         )
+    if ctx.config.allowed_models and model not in ctx.config.allowed_models:
+        return _err(
+            "unsupported_parameter",
+            f"model {model!r} is not in this server's allowed_models "
+            f"set ({list(ctx.config.allowed_models)}). Operator restricted "
+            f"the model list (typically because the OpenAI org isn't "
+            f"verified for the excluded models).",
+        )
 
     n = int(args.get("n", 1))
     size = args.get("size", "auto")

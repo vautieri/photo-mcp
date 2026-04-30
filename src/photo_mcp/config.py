@@ -33,10 +33,18 @@ from photo_mcp.paths import PathPolicy
 # -----------------------------------------------------------------------------
 
 DEFAULT_GENERATE_MODEL: Final = "gpt-image-1.5"
-DEFAULT_EDIT_MODEL: Final = "gpt-image-2"
+# gpt-image-2 requires OpenAI org verification (a one-time identity-check
+# step the operator runs at platform.openai.com). Unverified orgs get a
+# 403 on every edit/generate call. We default to gpt-image-1.5 so a fresh
+# install just works; verified orgs can override with PHOTO_MCP_DEFAULT_EDIT_MODEL.
+DEFAULT_EDIT_MODEL: Final = "gpt-image-1.5"
 DEFAULT_OUTPUT_FORMAT: Final = "png"
 DEFAULT_QUALITY: Final = "auto"
 DEFAULT_LOG_LEVEL: Final = "info"
+# Empty tuple means "all known models allowed". When non-empty, list_models
+# filters its output AND edit/generate reject calls with model not in the
+# set. Operator can constrain via PHOTO_MCP_ALLOWED_MODELS=gpt-image-1.5,gpt-image-1
+DEFAULT_ALLOWED_MODELS: Final[tuple[str, ...]] = ()
 
 
 # -----------------------------------------------------------------------------
@@ -75,6 +83,11 @@ class Config:
     default_edit_model: str = DEFAULT_EDIT_MODEL
     default_output_format: str = DEFAULT_OUTPUT_FORMAT
     default_quality: str = DEFAULT_QUALITY
+    # Allowlist for which gpt-image-* models this server will expose.
+    # Empty tuple = no restriction (all models in models.ALL_MODELS).
+    # Non-empty tuple: list_models hides others, edit/generate reject others
+    # with a structured "unsupported_model" error referencing the allowlist.
+    allowed_models: tuple[str, ...] = ()
 
     # --- cost controls ---------------------------------------------------
     # 0.0 means no ceiling (matches sponsor default per review guide §B.1).
@@ -165,6 +178,10 @@ def _apply_toml(cfg: Config, data: dict[str, object]) -> Config:
         updates["http_bind"] = data["http_bind"]
     if "follow_symlinks" in data and isinstance(data["follow_symlinks"], bool):
         updates["follow_symlinks"] = data["follow_symlinks"]
+    if "allowed_models" in data and isinstance(data["allowed_models"], list):
+        updates["allowed_models"] = tuple(
+            m for m in data["allowed_models"] if isinstance(m, str)
+        )
     if "allowed_input_roots" in data and isinstance(data["allowed_input_roots"], list):
         updates["allowed_input_roots"] = tuple(
             Path(p).expanduser().resolve() for p in data["allowed_input_roots"] if isinstance(p, str)
@@ -219,6 +236,12 @@ def _apply_env(cfg: Config) -> Config:
     ):
         if (val := os.environ.get(key_name, "").strip()):
             updates[attr] = val
+    if (val := os.environ.get("PHOTO_MCP_ALLOWED_MODELS", "").strip()):
+        # Comma-separated list. Whitespace tolerated. Unknown names accepted
+        # here and rejected later by validate_model() with a structured error.
+        updates["allowed_models"] = tuple(
+            m.strip() for m in val.split(",") if m.strip()
+        )
     if (val := os.environ.get("PHOTO_MCP_FOLLOW_SYMLINKS", "").strip().lower()):
         if val in {"true", "1", "yes", "on"}:
             updates["follow_symlinks"] = True
