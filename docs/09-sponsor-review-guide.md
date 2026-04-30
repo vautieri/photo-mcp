@@ -23,10 +23,14 @@ and re-baseline before the implementation phase begins.
 
 ### A.1 — Default model when you don't specify
 
-**Default**: `gpt-image-2` for edits, `gpt-image-1.5` for prompt-only generations
-**Why**: gpt-image-2 is highest fidelity and is the right default for editing your originals. For pure generation (no source), 1.5 is the price/quality sweet spot.
-**Tweakable?** Yes (one-line config change).
-**Your call**: Are these the right defaults? Or do you want gpt-image-2 everywhere, accepting the higher cost?
+**Default**: `gpt-image-1.5` for both edits and prompt-only generations
+**Why**: `gpt-image-2` is highest fidelity but requires OpenAI org verification (a one-time identity-check step) — every unverified org gets a 403 on the first call. We default to 1.5 so a fresh install just works; verified orgs can flip the default in two ways:
+- Per-call: pass `model: "gpt-image-2"` in the tool input.
+- Per-server: set `PHOTO_MCP_DEFAULT_EDIT_MODEL=gpt-image-2` in the env (or in `~/.config/photo-mcp/config.toml`).
+
+There's also an opt-in **allowlist** for operators who want to lock down which models the LLM is allowed to choose: set `PHOTO_MCP_ALLOWED_MODELS=gpt-image-1.5,gpt-image-1` and the LLM never sees the others in `list_models` (and `edit`/`generate`/`estimate_cost` reject them with a structured error). Useful when an org isn't verified for `gpt-image-2` and you want to remove the temptation entirely.
+
+**Your call**: Stay on 1.5 default? Or verify the org and switch to 2?
 
 ### A.2 — Default output format
 
