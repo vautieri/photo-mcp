@@ -55,9 +55,22 @@ profile by default.
 
 Inputs:
 - prompt (required): natural-language description, up to 32,000 chars
-- image (required): array of 1..16 source file paths. PNG/JPEG/WebP
-                    accepted; RAW (.cr3/.nef/.arw/...) auto-converted
-                    via rawpy. Each file must be ≤50 MB after conversion.
+- image (required): array of 1..16 source file paths. The server
+                    accepts these formats natively — DO NOT pre-convert:
+                      * PNG, JPEG, WebP, GIF
+                      * HEIC / HEIF (iPhone) — via pillow-heif
+                      * TIFF (single-frame or first-frame multi-page)
+                      * RAW: .cr2 .cr3 .nef .nrw .arw .srf .sr2 .dng
+                             .rw2 .raf .orf .pef .ptx .raw .x3f .3fr
+                             .fff .iiq — auto-converted via rawpy with
+                             photographer-grade de-bayer (camera WB,
+                             no auto-bright by default; override via
+                             `raw_params`)
+                    The original file is NEVER modified, moved, or
+                    deleted; conversion outputs go to a tempfile and
+                    are removed in a finally block. Each file must be
+                    ≤50 MB after conversion (RAW decode output, not
+                    raw bytes).
 - mask (optional): PNG with alpha channel; valid only when image array
                    has exactly one entry
 - model: gpt-image-2 (default) | gpt-image-1.5 | gpt-image-1 | gpt-image-1-mini
