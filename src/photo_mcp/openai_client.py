@@ -83,6 +83,11 @@ class ImageResponse:
     usage: ApiUsage
     model: ModelId
     request_ms: int
+    # 2026-05-22 — Unix-epoch seconds from the API response. Useful in
+    # sidecars/audit trails so we can tie a generated image back to
+    # the exact upstream call. ``None`` when the SDK didn't surface it
+    # (some older SDK builds drop the field on streamed responses).
+    created: int | None = None
 
 
 @dataclass(slots=True)
@@ -158,6 +163,12 @@ class GenerationRequest:
     output_compression: int | None = None
     background: BackgroundPolicy | None = None
     moderation: ModerationLevel | None = None
+    # 2026-05-22 capability backfill. user = end-user identifier for
+    # OpenAI's abuse-monitoring trace (multi-tenant deployments use
+    # this to flag a single misbehaving user without revoking the
+    # API key). partial_images = 0..3 streaming-only.
+    user: str | None = None
+    partial_images: int | None = None
     # NOTE: no response_format field — DALL-E parameter, rejected by gpt-image.
 
 
@@ -181,6 +192,10 @@ class EditRequest:
     output_compression: int | None = None
     input_fidelity: InputFidelity | None = None
     moderation: ModerationLevel | None = None
+    # 2026-05-22 capability backfill. See GenerationRequest above.
+    background: BackgroundPolicy | None = None
+    user: str | None = None
+    partial_images: int | None = None
     # NOTE: no response_format field — DALL-E parameter, rejected by gpt-image.
 
 
@@ -345,6 +360,10 @@ def _generation_kwargs(req: GenerationRequest) -> dict[str, Any]:
         kwargs["output_compression"] = req.output_compression
     if req.background:         kwargs["background"] = req.background
     if req.moderation:         kwargs["moderation"] = req.moderation
+    # 2026-05-22 capability backfill — see GenerationRequest.
+    if req.user:               kwargs["user"] = req.user
+    if req.partial_images is not None:
+        kwargs["partial_images"] = req.partial_images
     # response_format intentionally omitted: rejected by gpt-image with
     # "Unknown parameter: 'response_format'" — DALL-E-only.
     return kwargs
@@ -371,6 +390,11 @@ def _edit_kwargs(
         kwargs["output_compression"] = req.output_compression
     if req.input_fidelity:      kwargs["input_fidelity"] = req.input_fidelity
     if req.moderation:          kwargs["moderation"] = req.moderation
+    # 2026-05-22 capability backfill — see GenerationRequest.
+    if req.background:          kwargs["background"] = req.background
+    if req.user:                kwargs["user"] = req.user
+    if req.partial_images is not None:
+        kwargs["partial_images"] = req.partial_images
     # response_format intentionally omitted (DALL-E-only; rejected by gpt-image).
     return kwargs
 
@@ -413,8 +437,11 @@ def _normalize(sdk_response: Any, *, model: ModelId, request_ms: int) -> ImageRe
             if isinstance(usage_raw.get("input_tokens_details"), dict)
             else 0,
     )
+    created_raw = payload.get("created")
+    created = int(created_raw) if isinstance(created_raw, (int, float)) else None
     return ImageResponse(
-        images=images, usage=usage, model=model, request_ms=request_ms
+        images=images, usage=usage, model=model, request_ms=request_ms,
+        created=created,
     )
 
 

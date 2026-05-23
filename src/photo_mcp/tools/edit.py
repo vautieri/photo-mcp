@@ -75,11 +75,16 @@ Inputs:
                    has exactly one entry
 - model: gpt-image-2 (default) | gpt-image-1.5 | gpt-image-1 | gpt-image-1-mini
 - output_dir + output_basename: where to write the result (required)
-- n: 1..4
+- n: 1..10 (number of variations; OpenAI's /v1/images/edits supports 1..10)
 - size: 1024x1024, 1024x1536, 1536x1024, or auto. gpt-image-2 also
         supports 2048x* and 3840x2160 / 2160x3840 (4K).
 - quality: low | medium | high | auto (default: high — photographer-grade)
 - output_format: png (default — lossless) | jpeg | webp
+- background: opaque | auto (default) | transparent.
+                Transparent requires PNG/WebP output_format AND a
+                gpt-image-1.x model (gpt-image-2 does NOT support it).
+                Highest-impact use: subject cutouts where the photographer
+                wants a clean alpha channel rather than a fake-white plate.
 - input_fidelity: high (default) | low — preserves source detail when
                   high; not configurable on gpt-image-2 (always high)
 - preserve_metadata (default true): copy EXIF/IPTC/XMP from image[0]
@@ -117,7 +122,7 @@ _EDIT_SCHEMA: dict[str, Any] = {
         "model": {"type": "string", "enum": list(models.ALL_MODELS)},
         "output_dir": {"type": "string"},
         "output_basename": {"type": "string"},
-        "n": {"type": "integer", "minimum": 1, "maximum": 4, "default": 1},
+        "n": {"type": "integer", "minimum": 1, "maximum": 10, "default": 1},
         "size": {"type": "string", "default": "auto"},
         "quality": {
             "type": "string",
@@ -130,6 +135,11 @@ _EDIT_SCHEMA: dict[str, Any] = {
             "default": "png",
         },
         "output_compression": {"type": "integer", "minimum": 0, "maximum": 100},
+        "background": {
+            "type": "string",
+            "enum": ["opaque", "auto", "transparent"],
+            "default": "auto",
+        },
         "input_fidelity": {
             "type": "string",
             "enum": ["high", "low"],
@@ -141,6 +151,37 @@ _EDIT_SCHEMA: dict[str, Any] = {
         "raw_params": {"type": "object"},
         "pre_resize_to": {"type": "string"},
         "overwrite": {"type": "boolean", "default": False},
+        # 2026-05-22 capability backfill — expose params the openai client
+        # already supported but no tool surfaced. The LLM picks these up
+        # from the schema when relevant.
+        "stream": {
+            "type": "boolean",
+            "default": False,
+            "description": (
+                "Stream the edit. When true, partial frames stream back in the "
+                "result's `partials` array. Requires the SDK to support OpenAI's "
+                "Server-Sent-Events image stream."
+            ),
+        },
+        "partial_images": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 3,
+            "description": (
+                "Number of progressive partial frames to emit during a streamed "
+                "edit (0..3, OpenAI cap). Requires stream=true."
+            ),
+        },
+        "user": {
+            "type": "string",
+            "maxLength": 256,
+            "description": (
+                "Optional end-user identifier passed to OpenAI for abuse "
+                "monitoring. Multi-tenant deployments set this to the human "
+                "user's id so OpenAI can flag a single misbehaving end-user "
+                "without disabling the whole API key."
+            ),
+        },
     },
     "required": ["prompt", "image", "output_dir", "output_basename"],
     "additionalProperties": False,
@@ -196,6 +237,10 @@ async def _edit(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
     output_compression = args.get("output_compression")
     input_fidelity = args.get("input_fidelity", "high")
     moderation = args.get("moderation", "auto")
+    background = args.get("background", "auto")
+    user_id = args.get("user")
+    stream = bool(args.get("stream", False))
+    partial_images = args.get("partial_images")
     preserve_metadata = bool(args.get("preserve_metadata", True))
     preserve_color = bool(args.get("preserve_color_profile", True))
     overwrite = bool(args.get("overwrite", False))
@@ -205,6 +250,34 @@ async def _edit(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         return _err("unsupported_parameter", err.to_message())
     if (err := models.validate_input_fidelity(model, input_fidelity)) is not None:
         return _err("unsupported_parameter", err.to_message())
+    if (err := models.validate_background(model, background)) is not None:
+        return _err("unsupported_parameter", err.to_message())
+    # transparent requires alpha-capable container; jpeg has no alpha.
+    if background == "transparent" and output_format == "jpeg":
+        return _err(
+            "unsupported_parameter",
+            "background='transparent' requires output_format='png' or 'webp'; "
+            "JPEG has no alpha channel.",
+        )
+    # Type-check stream / partial_images.
+    if not isinstance(stream, bool):
+        return _err("invalid_request", "'stream' must be a boolean.")
+    if partial_images is not None:
+        if not isinstance(partial_images, int) or not (0 <= partial_images <= 3):
+            return _err(
+                "invalid_request",
+                "'partial_images' must be an integer in 0..3 (OpenAI cap).",
+            )
+        if not stream:
+            return _err(
+                "invalid_request",
+                "'partial_images' requires 'stream=true'.",
+            )
+    if user_id is not None and (not isinstance(user_id, str) or len(user_id) > 256):
+        return _err(
+            "invalid_request",
+            "'user' must be a string identifier (≤256 chars) for OpenAI abuse monitoring.",
+        )
 
     # ---- 2. Resolve paths ---------------------------------------------------
     pol = ctx.config.path_policy()
@@ -296,11 +369,20 @@ async def _edit(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
             quality=quality if quality != "auto" else None,
             output_format=output_format,
             output_compression=output_compression,
+            background=background if background != "auto" else None,
             input_fidelity=input_fidelity if model != "gpt-image-2" else None,
             moderation=moderation if moderation != "auto" else None,
+            user=user_id,
+            partial_images=partial_images if stream else None,
         )
+        partial_payloads: list[dict[str, Any]] = []
         try:
-            response = await ctx.openai_client.edit(req)
+            if stream:
+                response, partial_payloads = await _consume_edit_stream(
+                    ctx.openai_client, req
+                )
+            else:
+                response = await ctx.openai_client.edit(req)
         except (AuthError, OpenAIClientError) as e:
             return _err(getattr(e, "error_type", "openai_error"), str(e))
 
@@ -352,8 +434,12 @@ async def _edit(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
                     "quality": quality,
                     "output_format": output_format,
                     "output_compression": output_compression,
+                    "background": background,
                     "input_fidelity": input_fidelity,
                     "moderation": moderation,
+                    "user": user_id,
+                    "stream": stream,
+                    "partial_images": partial_images if stream else None,
                     "preserve_metadata": preserve_metadata,
                     "preserve_color_profile": preserve_color,
                 },
@@ -377,6 +463,7 @@ async def _edit(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         payload = {
             "files": file_paths,
             "model": model,
+            "background": background,
             "ssim_to_image_0": ssim_first,
             "metadata_preserved": preserve_metadata and meta_snap is not None and meta_snap.has_exif,
             "metadata_source": str(primary) if preserve_metadata and meta_snap else None,
@@ -386,10 +473,17 @@ async def _edit(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
                 "input_tokens": response.usage.input_tokens,
                 "output_tokens": response.usage.output_tokens,
                 "total_tokens": response.usage.total_tokens,
+                "input_tokens_details": {
+                    "text_tokens": response.usage.input_text_tokens,
+                    "image_tokens": response.usage.input_image_tokens,
+                },
             },
+            "created": response.created,
             "cost_usd_estimate": round(estimate.total_usd, 6),
             "session_total_usd": round(ctx.session_ledger.total_usd, 6),
             "request_ms": response.request_ms,
+            "stream": stream,
+            "partials": partial_payloads,
             "warnings": warnings,
         }
         return ToolResult(text=json.dumps(payload, indent=2), structured_payload=payload)
@@ -413,6 +507,68 @@ EDIT_TOOL = ToolDef(
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
+
+
+async def _consume_edit_stream(
+    client: Any, req: EditRequest
+) -> tuple[Any, list[dict[str, Any]]]:
+    """Drive the OpenAI stream-edit and split partial frames from the final
+    completion event.
+
+    2026-05-22 capability backfill. Returns:
+
+    * an ``ImageResponse``-shaped object built from the streaming completion
+      event so the caller's existing post-stream pipeline (write to disk,
+      reattach EXIF, compute SSIM, build sidecar) works unchanged
+    * a list of partial-frame payloads — each one a dict with ``index``,
+      ``b64_json``, optional ``revised_prompt`` — so the tool result can
+      surface progressive previews to the MCP client.
+    """
+    from photo_mcp.openai_client import (  # local import: avoids module-cycle
+        ApiUsage,
+        ImageData,
+        ImageResponse,
+        OpenAIClientError,
+    )
+
+    partials: list[dict[str, Any]] = []
+    completed: ImageResponse | None = None
+    started = _ms_now()
+    async for event in client.stream_edit(req):
+        if event.kind == "error":
+            raise OpenAIClientError(event.error or "stream error", error_type="openai_error")
+        if event.kind == "partial":
+            partials.append({
+                "index":          event.index,
+                "b64_json":       event.b64_json,
+                "revised_prompt": event.revised_prompt,
+            })
+            continue
+        if event.kind == "completed":
+            usage = event.usage or ApiUsage()
+            # Streaming completion carries the final image(s); synthesize
+            # the same ImageResponse shape the non-streaming path returns.
+            final_image = ImageData(
+                b64_json=event.b64_json,
+                revised_prompt=event.revised_prompt,
+            )
+            completed = ImageResponse(
+                images=[final_image] if event.b64_json else [],
+                usage=usage,
+                model=req.model,
+                request_ms=_ms_now() - started,
+                created=None,
+            )
+            break
+    if completed is None:
+        raise OpenAIClientError("stream ended without a completed event",
+                                 error_type="openai_error")
+    return completed, partials
+
+
+def _ms_now() -> int:
+    import time
+    return int(time.monotonic() * 1000)
 
 
 def _build_raw_params(raw_obj: Any) -> raw.RawParams:

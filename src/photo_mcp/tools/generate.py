@@ -100,6 +100,28 @@ _GENERATE_SCHEMA: dict[str, Any] = {
         },
         "moderation": {"type": "string", "enum": ["auto", "low"], "default": "auto"},
         "overwrite": {"type": "boolean", "default": False},
+        # 2026-05-22 capability backfill — see edit.py for the rationale.
+        "stream": {
+            "type": "boolean",
+            "default": False,
+            "description": (
+                "Stream the generation. When true, partial frames stream back "
+                "in the result's `partials` array."
+            ),
+        },
+        "partial_images": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 3,
+            "description": "Progressive partial frames (0..3). Requires stream=true.",
+        },
+        "user": {
+            "type": "string",
+            "maxLength": 256,
+            "description": (
+                "End-user identifier for OpenAI abuse monitoring (multi-tenant)."
+            ),
+        },
     },
     "required": ["prompt", "output_dir", "output_basename"],
     "additionalProperties": False,
@@ -139,6 +161,28 @@ async def _generate(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
     output_compression = args.get("output_compression")
     background = args.get("background", "auto")
     moderation = args.get("moderation", "auto")
+    # 2026-05-22 capability backfill.
+    user_id = args.get("user")
+    stream = bool(args.get("stream", False))
+    partial_images = args.get("partial_images")
+    if user_id is not None and (not isinstance(user_id, str) or len(user_id) > 256):
+        return _err(
+            "invalid_request",
+            "'user' must be a string identifier (≤256 chars).",
+        )
+    if not isinstance(stream, bool):
+        return _err("invalid_request", "'stream' must be a boolean.")
+    if partial_images is not None:
+        if not isinstance(partial_images, int) or not (0 <= partial_images <= 3):
+            return _err(
+                "invalid_request",
+                "'partial_images' must be an integer in 0..3.",
+            )
+        if not stream:
+            return _err(
+                "invalid_request",
+                "'partial_images' requires 'stream=true'.",
+            )
     overwrite = bool(args.get("overwrite", False))
 
     # Capability checks
@@ -205,9 +249,17 @@ async def _generate(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         output_compression=output_compression,
         background=background if background != "auto" else None,
         moderation=moderation if moderation != "auto" else None,
+        user=user_id,
+        partial_images=partial_images if stream else None,
     )
+    partial_payloads: list[dict[str, Any]] = []
     try:
-        response = await ctx.openai_client.generate(req)
+        if stream:
+            response, partial_payloads = await _consume_generate_stream(
+                ctx.openai_client, req
+            )
+        else:
+            response = await ctx.openai_client.generate(req)
     except (AuthError, OpenAIClientError) as e:
         return _err(getattr(e, "error_type", "openai_error"), str(e))
 
@@ -259,18 +311,77 @@ async def _generate(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
     payload = {
         "files": file_paths,
         "model": model,
+        "background": background,
         "revised_prompts": revised_prompts,
         "usage": {
             "input_tokens": response.usage.input_tokens,
             "output_tokens": response.usage.output_tokens,
             "total_tokens": response.usage.total_tokens,
+            "input_tokens_details": {
+                "text_tokens":  response.usage.input_text_tokens,
+                "image_tokens": response.usage.input_image_tokens,
+            },
         },
+        "created": response.created,
+        "user": user_id,
+        "stream": stream,
+        "partials": partial_payloads,
+        "partial_images": partial_images if stream else None,
         "cost_usd_estimate": round(actual or estimate.total_usd, 6),
         "session_total_usd": round(ctx.session_ledger.total_usd, 6),
         "request_ms": response.request_ms,
         "warnings": warnings,
     }
     return ToolResult(text=json.dumps(payload, indent=2), structured_payload=payload)
+
+
+async def _consume_generate_stream(
+    client: Any, req: GenerationRequest
+) -> tuple[Any, list[dict[str, Any]]]:
+    """Drive the OpenAI stream-generate and split partial frames from
+    the final completion event. Mirrors ``_consume_edit_stream`` in
+    edit.py so the generate path matches semantics."""
+    import time as _time
+
+    from photo_mcp.openai_client import (  # local import: avoids cycle
+        ApiUsage,
+        ImageData,
+        ImageResponse,
+        OpenAIClientError,
+    )
+
+    partials: list[dict[str, Any]] = []
+    completed: ImageResponse | None = None
+    started = int(_time.monotonic() * 1000)
+    async for event in client.stream_generate(req):
+        if event.kind == "error":
+            raise OpenAIClientError(event.error or "stream error", error_type="openai_error")
+        if event.kind == "partial":
+            partials.append({
+                "index":          event.index,
+                "b64_json":       event.b64_json,
+                "revised_prompt": event.revised_prompt,
+            })
+            continue
+        if event.kind == "completed":
+            usage = event.usage or ApiUsage()
+            final_image = ImageData(
+                b64_json=event.b64_json,
+                revised_prompt=event.revised_prompt,
+            )
+            completed = ImageResponse(
+                images=[final_image] if event.b64_json else [],
+                usage=usage,
+                model=req.model,
+                request_ms=int(_time.monotonic() * 1000) - started,
+                created=None,
+            )
+            break
+    if completed is None:
+        raise OpenAIClientError(
+            "stream ended without a completed event", error_type="openai_error"
+        )
+    return completed, partials
 
 
 GENERATE_TOOL = ToolDef(
