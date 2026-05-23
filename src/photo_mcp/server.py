@@ -16,6 +16,22 @@ Per the system design (§2 architecture), this module:
 The transport (stdio vs HTTP+SSE) is a separate concern — see
 ``transport_stdio.py`` and ``transport_http.py``. Both feed the same
 ``Server`` instance.
+
+Progressive imaging — 2026-05-22
+================================
+
+When a client supplies a ``_meta.progressToken`` on the ``tools/call``
+request (per the MCP spec), the dispatcher binds a ``progress_emitter``
+on the ``ToolContext`` that the streaming tools (``edit``, ``generate``)
+fire once per partial frame. The emitter sends an MCP
+``notifications/progress`` carrying the standard ``progress`` /
+``total`` fields *plus* a ``_meta`` extras bag with the partial's
+``b64_json`` payload, the partial ``index``, and the ``mime_type`` —
+so a client (the MICHAEL engine bridge, in our deployment) can render
+a progressive preview while the tool is still running. Clients that
+do NOT send a ``progressToken`` get the unchanged final result; the
+emitter is a no-op in that case. The LLM-visible tool result is
+unchanged regardless — partials are out-of-band UI metadata.
 """
 
 from __future__ import annotations
@@ -24,13 +40,56 @@ import json
 import traceback
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 from photo_mcp import __version__
 from photo_mcp.config import Config
 from photo_mcp.cost import PriceTable, SessionLedger
 from photo_mcp.logging import StructuredLogger, get_logger
 from photo_mcp.openai_client import OpenAIImageClient
+
+
+# -----------------------------------------------------------------------------
+# Progress emitter
+# -----------------------------------------------------------------------------
+
+
+class ProgressEmitter(Protocol):
+    """Out-of-band callback fired by streaming tools once per partial frame.
+
+    The streaming tools (``edit``, ``generate``) collect partial frames
+    from OpenAI's image stream and surface them in the final tool
+    result's ``partials`` array. That makes the LLM aware after the
+    fact but doesn't let the UI render an evolving preview. When the
+    MCP client sends a ``progressToken``, the dispatcher binds a
+    :class:`ProgressEmitter` that sends an MCP ``notifications/progress``
+    per partial. Clients that opt in render the progressive preview;
+    clients that don't get the unchanged final result.
+
+    Args:
+        index: zero-based frame index (0 .. partial_images-1).
+        total: total expected partials (== ``partial_images``).
+        b64_json: the partial frame, base64-encoded PNG/WebP/JPEG.
+        mime_type: best-effort guess — OpenAI's stream doesn't carry
+            the mime explicitly, so the caller passes the format
+            requested for the final write (PNG by default).
+        revised_prompt: OpenAI's safety-rewriter output for this
+            partial, if any. Optional.
+
+    Implementations must be non-blocking (async) and tolerant of an
+    unreliable transport — a dropped progress notification is a
+    cosmetic miss, never a correctness bug.
+    """
+
+    async def __call__(
+        self,
+        *,
+        index: int,
+        total: int,
+        b64_json: str,
+        mime_type: str,
+        revised_prompt: str | None = None,
+    ) -> None: ...
 
 
 # -----------------------------------------------------------------------------
@@ -52,6 +111,12 @@ class ToolContext:
     price_table: PriceTable
     session_ledger: SessionLedger
     openai_client: OpenAIImageClient | None  # None until first real call (lazy auth)
+    # Bound per-call by ``PhotoMcpServer._build_context`` when the MCP
+    # ``tools/call`` request carried a ``_meta.progressToken``. Streaming
+    # tools fire this once per partial frame; non-streaming tools (and
+    # streaming calls from clients that did not opt in) leave it None
+    # and emit nothing. See module docstring + :class:`ProgressEmitter`.
+    progress_emitter: ProgressEmitter | None = None
 
 
 # A tool is registered as: name, description, JSON Schema, async handler.
@@ -159,14 +224,103 @@ class PhotoMcpServer:
     # Internals
     # ------------------------------------------------------------------
 
-    def _build_context(self) -> ToolContext:
+    def _build_context(
+        self, progress_emitter: ProgressEmitter | None = None
+    ) -> ToolContext:
         return ToolContext(
             config=self._config,
             logger=self._log,
             price_table=self._price_table,
             session_ledger=self._ledger,
             openai_client=self._openai,
+            progress_emitter=progress_emitter,
         )
+
+    def _build_progress_emitter(self) -> ProgressEmitter | None:
+        """Build the per-call progress emitter, or None if the client
+        did not request progress.
+
+        The MCP spec attaches a ``progressToken`` to the request's
+        ``_meta`` field; we read it off the SDK's request context and
+        bind a closure that issues ``notifications/progress`` with the
+        canonical fields plus a ``_meta`` extras bag carrying the
+        partial-image payload. ``ProgressNotificationParams`` declares
+        ``extra='allow'`` so the extra key is preserved on the wire.
+
+        Returns None when:
+        - The request had no ``_meta`` block (older clients).
+        - The request had ``_meta`` but no ``progressToken`` (the
+          standard opt-out per the MCP spec).
+        - The SDK's request context isn't bound (defensive — should
+          never happen inside a tool handler).
+        """
+        # Lazy imports — the SDK module is heavy and we don't want to
+        # take its weight at static-analysis / tooling time.
+        try:
+            from mcp.server.lowlevel.server import request_ctx
+            from mcp.types import (
+                ProgressNotification,
+                ProgressNotificationParams,
+                ServerNotification,
+            )
+        except ImportError:  # pragma: no cover — SDK is a hard runtime dep
+            return None
+
+        try:
+            rc = request_ctx.get()
+        except LookupError:  # pragma: no cover
+            return None
+
+        meta = getattr(rc, "meta", None)
+        progress_token = getattr(meta, "progressToken", None) if meta else None
+        if progress_token is None:
+            return None
+
+        session = rc.session
+        related_request_id = getattr(rc, "request_id", None)
+        log = self._log
+
+        async def emit(
+            *,
+            index: int,
+            total: int,
+            b64_json: str,
+            mime_type: str,
+            revised_prompt: str | None = None,
+        ) -> None:
+            # Standard ProgressNotification fields keep generic progress
+            # UIs happy; the partial payload rides in the extras bag
+            # under ``_meta`` (Pydantic alias) per MCP convention.
+            params = ProgressNotificationParams(
+                progressToken=progress_token,
+                progress=float(index + 1),
+                total=float(total) if total else None,
+                message=f"partial {index + 1}/{total}" if total else f"partial {index + 1}",
+            )
+            extras: dict[str, Any] = {
+                "type":      "partial_image",
+                "index":     index,
+                "b64_json":  b64_json,
+                "mime_type": mime_type,
+            }
+            if revised_prompt:
+                extras["revised_prompt"] = revised_prompt
+            params.meta = ProgressNotificationParams.Meta(**extras)
+            try:
+                await session.send_notification(
+                    ServerNotification(ProgressNotification(params=params)),
+                    related_request_id=related_request_id,
+                )
+            except Exception as e:  # noqa: BLE001
+                # Best-effort UI metadata; a transport hiccup must never
+                # fail the underlying tool call.
+                log.warning(
+                    "progress_emit_failed",
+                    error_type=type(e).__name__,
+                    error=str(e),
+                )
+
+        return emit
 
     def _wire_handlers(self) -> None:
         srv = self._mcp
@@ -194,7 +348,7 @@ class PhotoMcpServer:
                 f"Unknown tool {name!r}. "
                 f"Registered: {sorted(self._tools)}"
             )
-        ctx = self._build_context()
+        ctx = self._build_context(progress_emitter=self._build_progress_emitter())
         try:
             self._log.debug("tool_dispatch", tool=name)
             result = await tool.handler(ctx, arguments or {})
@@ -231,6 +385,7 @@ class PhotoMcpServer:
 
 __all__ = [
     "PhotoMcpServer",
+    "ProgressEmitter",
     "ToolContext",
     "ToolDef",
     "ToolHandler",

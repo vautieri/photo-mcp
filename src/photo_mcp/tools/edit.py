@@ -393,7 +393,10 @@ async def _edit(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         try:
             if stream:
                 response, partial_payloads = await _consume_edit_stream(
-                    ctx.openai_client, req
+                    ctx.openai_client,
+                    req,
+                    progress_emitter=ctx.progress_emitter,
+                    output_format=output_format,
                 )
             else:
                 response = await ctx.openai_client.edit(req)
@@ -539,7 +542,11 @@ EDIT_TOOL = ToolDef(
 
 
 async def _consume_edit_stream(
-    client: Any, req: EditRequest
+    client: Any,
+    req: EditRequest,
+    *,
+    progress_emitter: Any = None,
+    output_format: str = "png",
 ) -> tuple[Any, list[dict[str, Any]]]:
     """Drive the OpenAI stream-edit and split partial frames from the final
     completion event.
@@ -552,6 +559,14 @@ async def _consume_edit_stream(
     * a list of partial-frame payloads — each one a dict with ``index``,
       ``b64_json``, optional ``revised_prompt`` — so the tool result can
       surface progressive previews to the MCP client.
+
+    2026-05-22 progressive imaging — when ``progress_emitter`` is non-None
+    (the MCP client supplied a ``progressToken`` on the call) the
+    emitter is fired once per partial frame so the bridge can forward
+    the preview as an SSE event. The emitter is best-effort: a failure
+    inside it must not fail the overall edit (the emitter itself logs
+    and swallows). The LLM-visible result (the returned ``partials``
+    list) is unchanged regardless of whether the emitter fired.
     """
     from photo_mcp.openai_client import (  # local import: avoids module-cycle
         ApiUsage,
@@ -560,9 +575,15 @@ async def _consume_edit_stream(
         OpenAIClientError,
     )
 
+    mime_type = _format_to_mime(output_format)
     partials: list[dict[str, Any]] = []
     completed: ImageResponse | None = None
     started = _ms_now()
+    # OpenAI caps streaming at 3 partials; we surface the count we
+    # actually see rather than ``req.partial_images`` so the bridge's
+    # ``total`` is honest when fewer partials land (fast finishes that
+    # skip the last partial event).
+    requested_total = req.partial_images or 0
     async for event in client.stream_edit(req):
         if event.kind == "error":
             raise OpenAIClientError(event.error or "stream error", error_type="openai_error")
@@ -572,6 +593,14 @@ async def _consume_edit_stream(
                 "b64_json":       event.b64_json,
                 "revised_prompt": event.revised_prompt,
             })
+            if progress_emitter is not None and event.b64_json:
+                await progress_emitter(
+                    index=event.index,
+                    total=max(requested_total, event.index + 1),
+                    b64_json=event.b64_json,
+                    mime_type=mime_type,
+                    revised_prompt=event.revised_prompt,
+                )
             continue
         if event.kind == "completed":
             usage = event.usage or ApiUsage()
@@ -598,6 +627,22 @@ async def _consume_edit_stream(
 def _ms_now() -> int:
     import time
     return int(time.monotonic() * 1000)
+
+
+def _format_to_mime(output_format: str) -> str:
+    """Map photo-mcp's output_format vocabulary to a MIME type string.
+
+    The MCP progress notification's ``_meta.mime_type`` field tells the
+    bridge / UI how to decode the base64 partial. OpenAI's streaming
+    protocol doesn't surface the partial's mime, but in practice the
+    partials match the requested ``output_format`` (PNG by default).
+    """
+    return {
+        "png":  "image/png",
+        "jpeg": "image/jpeg",
+        "jpg":  "image/jpeg",
+        "webp": "image/webp",
+    }.get(output_format.lower(), "image/png")
 
 
 def _build_raw_params(raw_obj: Any) -> raw.RawParams:

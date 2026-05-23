@@ -256,7 +256,10 @@ async def _generate(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
     try:
         if stream:
             response, partial_payloads = await _consume_generate_stream(
-                ctx.openai_client, req
+                ctx.openai_client,
+                req,
+                progress_emitter=ctx.progress_emitter,
+                output_format=output_format,
             )
         else:
             response = await ctx.openai_client.generate(req)
@@ -347,11 +350,21 @@ async def _generate(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
 
 
 async def _consume_generate_stream(
-    client: Any, req: GenerationRequest
+    client: Any,
+    req: GenerationRequest,
+    *,
+    progress_emitter: Any = None,
+    output_format: str = "png",
 ) -> tuple[Any, list[dict[str, Any]]]:
     """Drive the OpenAI stream-generate and split partial frames from
     the final completion event. Mirrors ``_consume_edit_stream`` in
-    edit.py so the generate path matches semantics."""
+    edit.py so the generate path matches semantics.
+
+    2026-05-22 progressive imaging — when ``progress_emitter`` is non-None
+    (the MCP client supplied a ``progressToken`` on the call) the
+    emitter is fired once per partial frame so the bridge can forward
+    the preview as an SSE event. See ``edit.py`` for the full rationale.
+    """
     import time as _time
 
     from photo_mcp.openai_client import (  # local import: avoids cycle
@@ -361,9 +374,19 @@ async def _consume_generate_stream(
         OpenAIClientError,
     )
 
+    # Mirror the mime mapping in edit.py — keep the helper colocated
+    # rather than introducing a shared module just for two callers.
+    mime_type = {
+        "png":  "image/png",
+        "jpeg": "image/jpeg",
+        "jpg":  "image/jpeg",
+        "webp": "image/webp",
+    }.get(output_format.lower(), "image/png")
+
     partials: list[dict[str, Any]] = []
     completed: ImageResponse | None = None
     started = int(_time.monotonic() * 1000)
+    requested_total = req.partial_images or 0
     async for event in client.stream_generate(req):
         if event.kind == "error":
             raise OpenAIClientError(event.error or "stream error", error_type="openai_error")
@@ -373,6 +396,14 @@ async def _consume_generate_stream(
                 "b64_json":       event.b64_json,
                 "revised_prompt": event.revised_prompt,
             })
+            if progress_emitter is not None and event.b64_json:
+                await progress_emitter(
+                    index=event.index,
+                    total=max(requested_total, event.index + 1),
+                    b64_json=event.b64_json,
+                    mime_type=mime_type,
+                    revised_prompt=event.revised_prompt,
+                )
             continue
         if event.kind == "completed":
             usage = event.usage or ApiUsage()
