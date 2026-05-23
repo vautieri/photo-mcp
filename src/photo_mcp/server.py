@@ -58,13 +58,14 @@ class ProgressEmitter(Protocol):
     """Out-of-band callback fired by streaming tools once per partial frame.
 
     The streaming tools (``edit``, ``generate``) collect partial frames
-    from OpenAI's image stream and surface them in the final tool
-    result's ``partials`` array. That makes the LLM aware after the
-    fact but doesn't let the UI render an evolving preview. When the
-    MCP client sends a ``progressToken``, the dispatcher binds a
-    :class:`ProgressEmitter` that sends an MCP ``notifications/progress``
-    per partial. Clients that opt in render the progressive preview;
-    clients that don't get the unchanged final result.
+    from OpenAI's image stream and currently surface them only in the
+    final tool result's ``partials`` array. That makes the LLM aware
+    after the fact but doesn't let the UI render an evolving preview.
+    Instead, when the MCP client sends a ``progressToken``, the
+    dispatcher binds a :class:`ProgressEmitter` that sends an MCP
+    ``notifications/progress`` per partial. Clients that opt in render
+    the progressive preview; clients that don't get the unchanged final
+    result.
 
     Args:
         index: zero-based frame index (0 .. partial_images-1).
@@ -115,7 +116,7 @@ class ToolContext:
     # ``tools/call`` request carried a ``_meta.progressToken``. Streaming
     # tools fire this once per partial frame; non-streaming tools (and
     # streaming calls from clients that did not opt in) leave it None
-    # and emit nothing. See module docstring + :class:`ProgressEmitter`.
+    # and emit nothing.
     progress_emitter: ProgressEmitter | None = None
 
 
@@ -278,7 +279,6 @@ class PhotoMcpServer:
 
         session = rc.session
         related_request_id = getattr(rc, "request_id", None)
-        log = self._log
 
         async def emit(
             *,
@@ -288,23 +288,29 @@ class PhotoMcpServer:
             mime_type: str,
             revised_prompt: str | None = None,
         ) -> None:
-            # Standard ProgressNotification fields keep generic progress
-            # UIs happy; the partial payload rides in the extras bag
-            # under ``_meta`` (Pydantic alias) per MCP convention.
+            # Construct the params dict explicitly so the extras land
+            # under ``_meta`` (Pydantic alias) on the wire — both the
+            # MCP spec and the bridge expect them there. Standard
+            # progress / total / message fields are kept so generic
+            # progress UIs still render a useful value.
             params = ProgressNotificationParams(
                 progressToken=progress_token,
                 progress=float(index + 1),
                 total=float(total) if total else None,
                 message=f"partial {index + 1}/{total}" if total else f"partial {index + 1}",
             )
+            # The pydantic model allows extras — attach via setattr so
+            # the dump path includes them.
             extras: dict[str, Any] = {
-                "type":      "partial_image",
-                "index":     index,
-                "b64_json":  b64_json,
+                "type": "partial_image",
+                "index": index,
+                "b64_json": b64_json,
                 "mime_type": mime_type,
             }
             if revised_prompt:
                 extras["revised_prompt"] = revised_prompt
+            # Put extras under the canonical ``_meta`` bag (the SDK's
+            # Pydantic model exposes it as `meta` with alias `_meta`).
             params.meta = ProgressNotificationParams.Meta(**extras)
             try:
                 await session.send_notification(
@@ -312,9 +318,9 @@ class PhotoMcpServer:
                     related_request_id=related_request_id,
                 )
             except Exception as e:  # noqa: BLE001
-                # Best-effort UI metadata; a transport hiccup must never
-                # fail the underlying tool call.
-                log.warning(
+                # Progress is best-effort UI metadata; a transport hiccup
+                # must never fail the underlying tool call.
+                self._log.warning(
                     "progress_emit_failed",
                     error_type=type(e).__name__,
                     error=str(e),

@@ -122,6 +122,20 @@ class StreamEvent:
     revised_prompt: str | None = None
     usage: ApiUsage | None = None
     error: str | None = None
+    # 2026-05-23 audit gap #9. Streaming partials and the completion
+    # event each carry a `created_at` from the API. Useful for
+    # measuring real partial-frame latency vs the request_ms estimate
+    # we compute locally. None when the SDK didn't include it.
+    created_at: int | None = None
+    # Echoed config on the completion event — same as on the
+    # non-streaming response. The completed event tells us what the
+    # API actually used for `auto`-resolved fields; without capturing
+    # these, the streamed-edit sidecar records "auto" the same way the
+    # pre-fix non-streamed one did.
+    background_used:    str | None = None
+    output_format_used: str | None = None
+    quality_used:       str | None = None
+    size_used:          str | None = None
 
 
 # -----------------------------------------------------------------------------
@@ -476,22 +490,45 @@ def _normalize(sdk_response: Any, *, model: ModelId, request_ms: int) -> ImageRe
 
 
 def _translate_stream_event(event: Any) -> StreamEvent:
-    """Map the SDK's streaming event object to our :class:`StreamEvent`."""
+    """Map the SDK's streaming event object to our :class:`StreamEvent`.
+
+    2026-05-23 audit gap #9 — captures `created_at` on both partial and
+    completed events, plus the echoed-config fields (background /
+    output_format / quality / size) on the completion event so the
+    streaming sidecar can record concrete values the same way the
+    non-streamed path does.
+    """
     payload = event.model_dump() if hasattr(event, "model_dump") else dict(event)
     kind = payload.get("type", "completed")
+
+    def _int_or_none(k: str) -> int | None:
+        v = payload.get(k)
+        return int(v) if isinstance(v, (int, float)) else None
+
+    def _str_or_none(k: str) -> str | None:
+        v = payload.get(k)
+        return v if isinstance(v, str) else None
+
     if kind in {"image.generation.partial_image", "image.edit.partial_image", "partial_image"}:
         return StreamEvent(
             kind="partial",
             index=int(payload.get("partial_image_index", 0)),
             b64_json=payload.get("b64_json") or payload.get("image", {}).get("b64_json"),
             revised_prompt=payload.get("revised_prompt"),
+            created_at=_int_or_none("created_at"),
         )
     if kind in {"image.generation.completed", "image.edit.completed", "completed"}:
         usage_raw = payload.get("usage") or {}
+        in_details = usage_raw.get("input_tokens_details") if isinstance(usage_raw.get("input_tokens_details"), dict) else None
+        out_details = usage_raw.get("output_tokens_details") if isinstance(usage_raw.get("output_tokens_details"), dict) else None
         usage = ApiUsage(
             input_tokens=int(usage_raw.get("input_tokens", 0)),
             output_tokens=int(usage_raw.get("output_tokens", 0)),
             total_tokens=int(usage_raw.get("total_tokens", 0)),
+            input_text_tokens=int(in_details.get("text_tokens", 0))   if in_details  else 0,
+            input_image_tokens=int(in_details.get("image_tokens", 0)) if in_details  else 0,
+            output_text_tokens=int(out_details.get("text_tokens", 0))   if out_details else 0,
+            output_image_tokens=int(out_details.get("image_tokens", 0)) if out_details else 0,
         )
         b64 = (
             payload.get("b64_json")
@@ -503,6 +540,11 @@ def _translate_stream_event(event: Any) -> StreamEvent:
             b64_json=b64,
             revised_prompt=payload.get("revised_prompt"),
             usage=usage,
+            created_at=_int_or_none("created_at"),
+            background_used=_str_or_none("background"),
+            output_format_used=_str_or_none("output_format"),
+            quality_used=_str_or_none("quality"),
+            size_used=_str_or_none("size"),
         )
     return StreamEvent(kind="error", error=f"unknown stream event: {kind}")
 

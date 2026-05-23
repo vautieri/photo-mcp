@@ -563,10 +563,10 @@ async def _consume_edit_stream(
     2026-05-22 progressive imaging — when ``progress_emitter`` is non-None
     (the MCP client supplied a ``progressToken`` on the call) the
     emitter is fired once per partial frame so the bridge can forward
-    the preview as an SSE event. The emitter is best-effort: a failure
-    inside it must not fail the overall edit (the emitter itself logs
-    and swallows). The LLM-visible result (the returned ``partials``
-    list) is unchanged regardless of whether the emitter fired.
+    the preview as an SSE event. The emitter is best-effort: failures
+    are logged and don't fail the overall edit. The LLM-visible result
+    (the ``partials`` list returned alongside the response) is
+    unchanged regardless of whether the emitter fired.
     """
     from photo_mcp.openai_client import (  # local import: avoids module-cycle
         ApiUsage,
@@ -579,10 +579,10 @@ async def _consume_edit_stream(
     partials: list[dict[str, Any]] = []
     completed: ImageResponse | None = None
     started = _ms_now()
-    # OpenAI caps streaming at 3 partials; we surface the count we
-    # actually see rather than ``req.partial_images`` so the bridge's
-    # ``total`` is honest when fewer partials land (fast finishes that
-    # skip the last partial event).
+    # OpenAI's stream cap is 3 partials; we surface the count we actually
+    # see rather than ``req.partial_images`` so the bridge's ``total`` is
+    # honest even when the API delivers fewer than requested (e.g. fast
+    # finishes that skip the last partial).
     requested_total = req.partial_images or 0
     async for event in client.stream_edit(req):
         if event.kind == "error":
@@ -606,6 +606,9 @@ async def _consume_edit_stream(
             usage = event.usage or ApiUsage()
             # Streaming completion carries the final image(s); synthesize
             # the same ImageResponse shape the non-streaming path returns.
+            # 2026-05-23 — propagate echoed config from the completion
+            # event so the sidecar records concrete values for `auto`-
+            # resolved fields, matching the non-streaming path.
             final_image = ImageData(
                 b64_json=event.b64_json,
                 revised_prompt=event.revised_prompt,
@@ -615,7 +618,11 @@ async def _consume_edit_stream(
                 usage=usage,
                 model=req.model,
                 request_ms=_ms_now() - started,
-                created=None,
+                created=event.created_at,
+                background_used=event.background_used,
+                output_format_used=event.output_format_used,
+                quality_used=event.quality_used,
+                size_used=event.size_used,
             )
             break
     if completed is None:
