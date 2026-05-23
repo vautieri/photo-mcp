@@ -308,7 +308,7 @@ async def _edit(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
             )
             mask_path = _maybe_decode_raw(mask_path, raw_params_obj, tmp_files, warnings)
 
-        # 50 MB API limit
+        # 50 MB API limit (per-image)
         for p in upload_paths:
             sz = p.stat().st_size
             if sz > 50 * 1024 * 1024:
@@ -317,6 +317,20 @@ async def _edit(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
                     f"input {p} is {sz} bytes; OpenAI accepts ≤ 50 MB. "
                     "Pass 'pre_resize_to' to opt into a server-side downscale "
                     "or resize in your photo pipeline.",
+                )
+        # 2026-05-23 — 4 MB mask cap. OpenAI's /v1/images/edits has a
+        # smaller per-mask ceiling than the image limit; uploading a
+        # larger mask 4xx's with a confusing error. Catch it pre-flight
+        # so the photographer sees a clear message instead of a wire
+        # rejection mid-upload.
+        if mask_path is not None:
+            mask_sz = mask_path.stat().st_size
+            if mask_sz > 4 * 1024 * 1024:
+                return _err(
+                    "input_too_large",
+                    f"mask {mask_path} is {mask_sz} bytes; OpenAI accepts ≤ 4 MB "
+                    "for the mask file (separate from the 50 MB image cap). "
+                    "Resize / re-compress the mask PNG before passing.",
                 )
 
         # Capture metadata + color profile from image[0] BEFORE upload.
@@ -474,9 +488,24 @@ async def _edit(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
                 "output_tokens": response.usage.output_tokens,
                 "total_tokens": response.usage.total_tokens,
                 "input_tokens_details": {
-                    "text_tokens": response.usage.input_text_tokens,
+                    "text_tokens":  response.usage.input_text_tokens,
                     "image_tokens": response.usage.input_image_tokens,
                 },
+                "output_tokens_details": {
+                    "text_tokens":  response.usage.output_text_tokens,
+                    "image_tokens": response.usage.output_image_tokens,
+                },
+            },
+            # 2026-05-23 — echo what the API actually decided for any
+            # `auto`-resolved field so the sidecar's audit trail records
+            # the concrete value (1536x1024, opaque, png, high, …) rather
+            # than the request's "auto". Null means the SDK didn't
+            # surface that field on this response.
+            "resolved": {
+                "background":    response.background_used,
+                "output_format": response.output_format_used,
+                "quality":       response.quality_used,
+                "size":          response.size_used,
             },
             "created": response.created,
             "cost_usd_estimate": round(estimate.total_usd, 6),

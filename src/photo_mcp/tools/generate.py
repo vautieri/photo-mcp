@@ -321,6 +321,17 @@ async def _generate(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
                 "text_tokens":  response.usage.input_text_tokens,
                 "image_tokens": response.usage.input_image_tokens,
             },
+            "output_tokens_details": {
+                "text_tokens":  response.usage.output_text_tokens,
+                "image_tokens": response.usage.output_image_tokens,
+            },
+        },
+        # 2026-05-23 — echoed config (see edit.py for the rationale).
+        "resolved": {
+            "background":    response.background_used,
+            "output_format": response.output_format_used,
+            "quality":       response.quality_used,
+            "size":          response.size_used,
         },
         "created": response.created,
         "user": user_id,
