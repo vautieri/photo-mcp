@@ -69,6 +69,12 @@ class ApiUsage:
     total_tokens: int = 0
     input_text_tokens: int = 0
     input_image_tokens: int = 0
+    # 2026-05-23 — symmetric to input_tokens_details. The API breaks
+    # OUTPUT token spend into text vs image so the sidecar can record
+    # how much of the cost was the model's reasoning vs the actual
+    # rendered image. Without this the audit-cost line lumps them.
+    output_text_tokens: int = 0
+    output_image_tokens: int = 0
 
 
 @dataclass(slots=True)
@@ -88,6 +94,17 @@ class ImageResponse:
     # the exact upstream call. ``None`` when the SDK didn't surface it
     # (some older SDK builds drop the field on streamed responses).
     created: int | None = None
+    # 2026-05-23 — Echoed config from the API response. When the caller
+    # requested ``auto`` for size/quality/background/output_format, the
+    # API picks a concrete value and echoes it back. Without capturing
+    # these, the sidecar's `parameters` block records "auto" — useless
+    # for forensic reconstruction. The photographer's whole point of
+    # using photo-mcp over the OpenAI playground is "I want to know
+    # EXACTLY what was generated and how"; this closes the gap.
+    background_used:    str | None = None
+    output_format_used: str | None = None
+    quality_used:       str | None = None
+    size_used:          str | None = None
 
 
 @dataclass(slots=True)
@@ -426,22 +443,35 @@ def _normalize(sdk_response: Any, *, model: ModelId, request_ms: int) -> ImageRe
         for item in images_raw
     ]
     usage_raw = payload.get("usage") or {}
+    in_details = usage_raw.get("input_tokens_details") if isinstance(usage_raw.get("input_tokens_details"), dict) else None
+    out_details = usage_raw.get("output_tokens_details") if isinstance(usage_raw.get("output_tokens_details"), dict) else None
     usage = ApiUsage(
         input_tokens=int(usage_raw.get("input_tokens", 0)),
         output_tokens=int(usage_raw.get("output_tokens", 0)),
         total_tokens=int(usage_raw.get("total_tokens", 0)),
-        input_text_tokens=int(usage_raw.get("input_tokens_details", {}).get("text_tokens", 0))
-            if isinstance(usage_raw.get("input_tokens_details"), dict)
-            else 0,
-        input_image_tokens=int(usage_raw.get("input_tokens_details", {}).get("image_tokens", 0))
-            if isinstance(usage_raw.get("input_tokens_details"), dict)
-            else 0,
+        input_text_tokens=int(in_details.get("text_tokens", 0))   if in_details  else 0,
+        input_image_tokens=int(in_details.get("image_tokens", 0)) if in_details  else 0,
+        output_text_tokens=int(out_details.get("text_tokens", 0))   if out_details else 0,
+        output_image_tokens=int(out_details.get("image_tokens", 0)) if out_details else 0,
     )
     created_raw = payload.get("created")
     created = int(created_raw) if isinstance(created_raw, (int, float)) else None
+
+    # Echoed-config — API tells us what it actually used after auto-
+    # resolution. Helps the sidecar record a concrete value instead of
+    # "auto". Each field is best-effort; missing means the SDK didn't
+    # surface it on this response.
+    def _str_or_none(k: str) -> str | None:
+        v = payload.get(k)
+        return v if isinstance(v, str) else None
+
     return ImageResponse(
         images=images, usage=usage, model=model, request_ms=request_ms,
         created=created,
+        background_used=_str_or_none("background"),
+        output_format_used=_str_or_none("output_format"),
+        quality_used=_str_or_none("quality"),
+        size_used=_str_or_none("size"),
     )
 
 
