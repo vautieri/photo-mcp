@@ -21,23 +21,38 @@ from photo_mcp.server import ToolContext, ToolDef, ToolResult
 
 
 _LIST_MODELS_DESC = """\
-List all gpt-image model versions supported by this server, with their
-capability matrix. Use this before calling 'generate' or 'edit' to see
-which model supports which parameter (sizes, transparent background,
-input_fidelity, etc.). The matrix is verified against OpenAI's
-published API.
+List every gpt-image model version this server exposes, with its full
+capability matrix. Call this BEFORE 'generate' or 'edit' if you need to
+pick the right model for a constraint (e.g. transparent background,
+4K output, multi-image composite). The matrix is the source of truth
+for which parameters that model accepts — call sites that violate it
+get a structured 'unsupported_parameter' error pre-flight.
 
-Returns: JSON with one entry per model containing:
-- model: identifier (e.g. "gpt-image-2")
-- allowed_sizes: list of allowed size strings
-- allowed_qualities: list of allowed quality levels
-- allowed_output_formats: png/jpeg/webp
-- allowed_backgrounds: opaque/auto (and transparent for 1.x)
-- supports_input_fidelity: bool (true for 1.x, false for 2)
-- max_input_images: 16 (all models)
-- max_input_image_bytes: 50 MB (all models)
-- max_prompt_chars: 32000 (all models)
-- notes: free-form sponsor-facing notes about the model
+Returns JSON `{models: [...]}` with one entry per model:
+- model: identifier (e.g. "gpt-image-2", "gpt-image-1.5", "gpt-image-1",
+         "gpt-image-1-mini")
+- allowed_sizes: list of accepted size strings ("auto" plus concrete
+                 pixel dimensions; gpt-image-2 includes 2K + 4K)
+- allowed_qualities: low / medium / high / auto
+- allowed_output_formats: png / jpeg / webp
+- allowed_backgrounds: opaque / auto (transparent ONLY on gpt-image-1.x,
+                       NOT on gpt-image-2)
+- allowed_moderations: low / auto
+- always_returns_base64: true (the response_format=url DALL-E parameter
+                         is rejected by gpt-image; we always get b64)
+- supports_input_fidelity: true for 1.x, false for 2 (which is always high)
+- supports_streaming: bool — pass `stream=true` on generate/edit
+- supports_partial_images: bool — pass `partial_images=N` (0..3) with
+                           `stream=true` for progressive previews
+- supports_output_compression: bool — pass `output_compression=0..100`
+                                for webp/jpeg outputs
+- max_input_images: 16 (all gpt-image models accept 1..16 source images
+                    on /edit)
+- max_input_image_bytes: 50 MB per image (mask cap is 4 MB, enforced
+                         pre-flight)
+- max_prompt_chars: 32000
+- notes: free-form per-model notes (deprecation warnings, sponsor
+         availability constraints, etc.)
 """
 
 
@@ -128,7 +143,8 @@ _ESTIMATE_COST_SCHEMA: dict[str, Any] = {
     "properties": {
         "model": {
             "type": "string",
-            "description": "Model identifier (gpt-image-1, gpt-image-1-mini, gpt-image-1.5, gpt-image-2)",
+            "enum": list(models.ALL_MODELS),
+            "description": "Model identifier. Use list_models for full capability matrix.",
         },
         "quality": {
             "type": "string",

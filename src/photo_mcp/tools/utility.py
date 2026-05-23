@@ -13,26 +13,41 @@ import json
 from pathlib import Path
 from typing import Any
 
-from photo_mcp import metadata
+from photo_mcp import color, metadata
 from photo_mcp.paths import PathError
 from photo_mcp.server import ToolContext, ToolDef, ToolResult
 
 
 _ATTACH_DESC = """\
-Copy EXIF / IPTC / XMP metadata from a source file to a target file.
-Used to reattach photographer metadata after an external transformation
-that stripped it. Both paths must already exist and be under the
-configured allowed roots.
+Copy EXIF / IPTC / XMP metadata AND ICC color profile from a source
+file to a target file. Used to reattach photographer-grade provenance
+after an external transformation stripped it (Lightroom export,
+external resizer, etc.). Both paths must already exist and live under
+the configured allowed roots.
+
+Accepted source formats: PNG, JPEG, WebP, GIF, TIFF, HEIC/HEIF (via
+pillow-heif), and RAW (.cr2/.cr3/.nef/.arw/.dng/.raf/etc — read-only
+on the metadata side; the binary is not re-encoded). Targets are
+typically PNG/JPEG/WebP/TIFF — formats that can hold EXIF + ICC.
 
 Inputs:
-- source: path to the file holding the desired metadata
-- target: path to the file that should receive the metadata
-- fields: optional list of field categories to limit the copy to.
-          Valid: 'exif', 'iptc', 'xmp'. Default: all three.
+- source: path to the file holding the desired metadata + color profile
+- target: path to the file that should receive them
+- fields: optional list of field categories to copy. Valid:
+    * 'exif' (camera/lens/exposure tags)
+    * 'iptc' (caption/keywords/copyright)
+    * 'xmp' (Adobe sidecar metadata, ratings, edits)
+    * 'icc' (color profile — preserves AdobeRGB/ProPhoto/DisplayP3
+            sources so the target renders identically; 2026-05-23
+            addition. Without this, the target stays in whatever
+            color space it was saved as, often sRGB-default which
+            visibly shifts wedding/portrait skin tones.)
+  Default: all four categories.
 
 Returns: JSON with:
 - source, target (canonicalized paths)
-- copied: object showing which categories were copied (and any per-category warnings)
+- copied: per-category booleans showing which were actually applied
+- color_profile_name: identified profile name if 'icc' was requested
 - warnings: aggregated list of non-fatal warnings
 """
 
@@ -40,12 +55,12 @@ Returns: JSON with:
 _ATTACH_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "source": {"type": "string", "description": "File whose metadata is the source of truth"},
-        "target": {"type": "string", "description": "File that receives the metadata"},
+        "source": {"type": "string", "description": "File whose metadata + ICC profile is the source of truth"},
+        "target": {"type": "string", "description": "File that receives them"},
         "fields": {
             "type": "array",
-            "items": {"type": "string", "enum": ["exif", "iptc", "xmp"]},
-            "description": "Limit copy to these categories. Default: all three.",
+            "items": {"type": "string", "enum": ["exif", "iptc", "xmp", "icc"]},
+            "description": "Limit copy to these categories. Default: all four.",
         },
     },
     "required": ["source", "target"],
@@ -59,7 +74,7 @@ async def _attach_metadata(ctx: ToolContext, args: dict[str, Any]) -> ToolResult
     if not isinstance(raw_source, str) or not isinstance(raw_target, str):
         return _err("invalid_request", "Both 'source' and 'target' must be strings.")
 
-    fields = args.get("fields") or ["exif", "iptc", "xmp"]
+    fields = args.get("fields") or ["exif", "iptc", "xmp", "icc"]
     if not isinstance(fields, list) or not all(isinstance(f, str) for f in fields):
         return _err("invalid_request", "'fields' must be a list of strings.")
 
@@ -71,8 +86,10 @@ async def _attach_metadata(ctx: ToolContext, args: dict[str, Any]) -> ToolResult
     except PathError as e:
         return _err(e.error_type, str(e))
 
+    warnings: list[str] = []
+
+    # ---- EXIF / IPTC / XMP ---------------------------------------------------
     snap = metadata.capture(source)
-    # Filter the snapshot per requested fields.
     if "exif" not in fields:
         snap.has_exif = False
     if "iptc" not in fields:
@@ -80,8 +97,27 @@ async def _attach_metadata(ctx: ToolContext, args: dict[str, Any]) -> ToolResult
     if "xmp" not in fields:
         snap.has_xmp = False
 
-    warnings = list(snap.warnings)
-    warnings.extend(metadata.reattach(snap, target))
+    warnings.extend(snap.warnings)
+    if any(f in fields for f in ("exif", "iptc", "xmp")):
+        warnings.extend(metadata.reattach(snap, target))
+
+    # ---- ICC ----------------------------------------------------------------
+    # 2026-05-23 — standalone ICC reattach. Previously only callable
+    # internally from edit.py via color.embed; surfacing here so a
+    # photographer who exported through Lightroom (which sometimes
+    # converts to sRGB without asking) can re-embed their AdobeRGB /
+    # ProPhoto profile onto the round-tripped JPEG.
+    color_profile_name: str | None = None
+    if "icc" in fields:
+        profile = color.capture(source)
+        if profile is None:
+            warnings.append(f"source {source} has no embedded ICC profile; skipped 'icc' field")
+        else:
+            color_profile_name = profile.identified_name
+            try:
+                color.embed(target, profile)
+            except Exception as e:  # noqa: BLE001
+                warnings.append(f"failed to embed ICC profile onto {target}: {e}")
 
     payload = {
         "source": str(source),
@@ -89,8 +125,10 @@ async def _attach_metadata(ctx: ToolContext, args: dict[str, Any]) -> ToolResult
         "copied": {
             "exif": snap.has_exif and "exif" in fields,
             "iptc": snap.has_iptc and "iptc" in fields,
-            "xmp": snap.has_xmp and "xmp" in fields,
+            "xmp":  snap.has_xmp  and "xmp"  in fields,
+            "icc":  "icc" in fields and color_profile_name is not None,
         },
+        "color_profile_name": color_profile_name,
         "warnings": warnings,
     }
     return ToolResult(text=json.dumps(payload, indent=2), structured_payload=payload)
